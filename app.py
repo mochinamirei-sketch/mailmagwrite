@@ -40,19 +40,118 @@ INITIAL_BANNER_DEFAULTS = [
 ]
 
 
+GIST_FILENAME = "banner_defaults.json"
+
+
+def _gist_config():
+    """Secrets から GitHub トークンと Gist ID を取得（未設定なら空文字）"""
+    try:
+        token = st.secrets.get("GITHUB_TOKEN", "")
+        gist_id = st.secrets.get("GIST_ID", "")
+    except Exception:
+        return "", ""
+    return token, gist_id
+
+
+def _gist_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _is_valid_banners(data):
+    return (
+        isinstance(data, list)
+        and len(data) >= 2
+        and all(
+            isinstance(b, dict) and "link_url" in b and "image_url" in b
+            for b in data[:2]
+        )
+    )
+
+
 def load_banner_defaults():
+    """バナーのデフォルト値を読み込む。優先順: Gist → ローカルファイル → 初期値"""
+    token, gist_id = _gist_config()
+    if token and gist_id:
+        try:
+            res = requests.get(
+                f"https://api.github.com/gists/{gist_id}",
+                headers=_gist_headers(token),
+                timeout=10,
+            )
+            res.raise_for_status()
+            f = res.json().get("files", {}).get(GIST_FILENAME)
+            if f:
+                content = f.get("content", "")
+                if f.get("truncated"):
+                    content = requests.get(
+                        f["raw_url"], headers=_gist_headers(token), timeout=10
+                    ).text
+                if content.strip():
+                    data = json.loads(content)
+                    if _is_valid_banners(data):
+                        return data
+        except Exception as e:
+            st.session_state["banner_storage_error"] = (
+                f"Gistからの読み込みに失敗しました: {e}"
+            )
+
     if os.path.exists(BANNER_DEFAULTS_FILE):
         try:
             with open(BANNER_DEFAULTS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if _is_valid_banners(data):
+                return data
         except Exception:
             pass
     return copy.deepcopy(INITIAL_BANNER_DEFAULTS)
 
 
 def save_banner_defaults(banners):
-    with open(BANNER_DEFAULTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(banners, f, ensure_ascii=False, indent=2)
+    """バナーのデフォルト値を保存する。戻り値: (status, message)
+    status は "ok" / "warn"（一時保存のみ）/ "error"
+    """
+    token, gist_id = _gist_config()
+    if token and gist_id:
+        try:
+            res = requests.patch(
+                f"https://api.github.com/gists/{gist_id}",
+                headers=_gist_headers(token),
+                json={
+                    "files": {
+                        GIST_FILENAME: {
+                            "content": json.dumps(banners, ensure_ascii=False, indent=2)
+                        }
+                    }
+                },
+                timeout=10,
+            )
+            res.raise_for_status()
+            return "ok", "バナーの内容をGistに保存しました。アプリが再起動しても引き継がれます。"
+        except Exception as e:
+            return "error", f"Gistへの保存に失敗しました: {e}"
+
+    try:
+        with open(BANNER_DEFAULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(banners, f, ensure_ascii=False, indent=2)
+        return "warn", (
+            "GitHub Gistの設定（GITHUB_TOKEN / GIST_ID）がないため、一時ファイルに保存しました。"
+            "アプリの再起動で消えます。"
+        )
+    except Exception as e:
+        return "error", f"保存に失敗しました: {e}"
+
+
+def _show_save_result(status, message):
+    if status == "ok":
+        st.success(message)
+    elif status == "warn":
+        st.warning(message)
+    else:
+        st.error(message)
 
 
 def new_uid():
@@ -811,6 +910,14 @@ for i in range(3):
 
 st.divider()
 st.subheader("レコメンドバナー（前回の内容を引き継ぎます）")
+if st.session_state.get("banner_storage_error"):
+    st.warning(st.session_state["banner_storage_error"])
+_tok, _gid = _gist_config()
+if not (_tok and _gid):
+    st.info(
+        "バナーの保存先（GitHub Gist）が未設定です。このままだとアプリの再起動で内容が消えます。"
+        "Secretsに GITHUB_TOKEN と GIST_ID を設定してください。"
+    )
 
 banner_inputs = []
 for i in range(2):
@@ -828,9 +935,10 @@ for i in range(2):
         banner_inputs.append({"link_url": link_url, "image_url": image_url})
 
 if st.button("この内容を次回のデフォルトとして保存"):
-    save_banner_defaults(banner_inputs)
-    st.session_state.banners = banner_inputs
-    st.success("バナーの内容を保存しました。次回起動時から引き継がれます。")
+    status, message = save_banner_defaults(banner_inputs)
+    if status != "error":
+        st.session_state.banners = banner_inputs
+    _show_save_result(status, message)
 
 st.divider()
 
@@ -878,6 +986,15 @@ if st.session_state.get("drafted"):
         text_output = compose_text(edited_products, final_banners)
         st.session_state["json_output"] = json_output
         st.session_state["text_output"] = text_output
+        # バナーの内容が前回から変わっていれば、次回に引き継ぐため自動で保存する
+        if final_banners != st.session_state.banners:
+            status, message = save_banner_defaults(final_banners)
+            if status != "error":
+                st.session_state.banners = final_banners
+            if status == "ok":
+                st.toast("バナーの内容を次回用に保存しました")
+            else:
+                _show_save_result(status, message)
 
 if "json_output" in st.session_state:
     st.divider()
